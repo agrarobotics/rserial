@@ -2,6 +2,9 @@
 name = "rserial"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Native Rust serial monitor: terminal UI plus a tsgo7 web UI, fully remote-controllable through a local REST API"
+repository = "https://github.com/agrarobotics/rserial"
 
 [dependencies]
 ratatui = "0.29"
