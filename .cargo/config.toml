@@ -1,0 +1,5 @@
+[env]
+PKG_CONFIG_PATH = { value = "/home/maxx/.local/lib/pkgconfig", force = false }
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "/home/maxx/.local/lib"]
