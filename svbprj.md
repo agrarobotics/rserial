@@ -95,7 +95,10 @@ After modifying the `.desktop` file, refresh with `update-desktop-database ~/.lo
 - `src/main.rs` — entry point, CLI parsing (`--api`/`--api-port`), terminal init/restore, main loop
 - `src/app.rs` — App state machine, SerialConfig, display modes, `open_help()`, `reconnect()`, `poll_api()`
 - `src/api.rs` — localhost REST API (`tiny_http`), `ApiCommand`/`ApiState`
-- `src/serial.rs` — serial port listing, reader/writer threads via mpsc
+- `src/serial.rs` — port listing (USB first), reader/writer threads (`spawn_serial` → generic `spawn_io`, testable with fake I/O)
+- `src/engine.rs` — `Engine`: shared frame log (epoch, limit), stats, framing config; every frame goes through `emit()`
+- `src/bus.rs` — `FrameBus`: session/seq, per-subscriber bounded queues (drop-oldest + `dropped_before`), batching (from RSerialDebugAssistant, MIT)
+- `src/framing.rs` — `FrameSegmenter`: Timeout / Combined (delimiter+timeout) framing, 64 KiB cap (from RSerialDebugAssistant, MIT)
 - `src/events.rs` — key event dispatcher per app mode (global Ctrl+Q / Ctrl+H)
 - `src/ui/mod.rs` — draw dispatcher, quit confirmation dialog
 - `src/ui/port_select.rs` — port list screen
@@ -105,8 +108,13 @@ After modifying the `.desktop` file, refresh with `update-desktop-database ~/.lo
 ## Architecture
 
 - No async runtime — serial I/O uses `std::thread` + `std::sync::mpsc` channels
-- Reader thread: reads from port with 100ms timeout, sends `SerialEvent::Data` via bounded `sync_channel(256)`
-- Writer thread: receives `Vec<u8>` from UI, writes to cloned port handle
+- One `Arc<Engine>` lives for the whole process; connections come and go. A fresh connect starts a new bus session (seq from 1) and resets stats; an API auto-reconnect starts a session but keeps stats and the TUI buffer
+- Reader thread: 50 ms read timeout → `FrameSegmenter` (default Combined / AnyNewline / 50 ms) → `engine.emit(Rx, frame)`; the idle check also runs *before* feeding fresh bytes, so a gap spent inside a blocking `read()` still cuts the frame. Partial frame is flushed on stop and on read error
+- Writer thread: receives `Vec<u8>` from UI, writes to the cloned handle (1 s write timeout), then `engine.emit(Tx, data)` — TX and RX share one seq
+- `emit()` holds the log lock across seq allocation, log append and bus publish, so every reader sees seq order
+- The TUI is a bus subscriber (`try_recv_batch` once per tick) and shows RX only; the web UI / HTTP stream will be further subscribers (porting step 2)
+- `SerialEvent` now carries only `Error` / `Disconnected`; data never goes through it
+- Tests: `cargo test` (fake reader/writer, no hardware). Real-port round trip over a socat pty pair: see the ignored `serial::tests::real_port_roundtrip`
 - Stop signal: `Arc<AtomicBool>` checked each iteration
 - Main loop runs at ~60fps (16ms poll interval)
 - REST API (opt-in): separate `tiny_http` thread → `ApiCommand` mpsc → UI thread; status published back via `Arc<Mutex<ApiState>>`

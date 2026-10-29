@@ -1,6 +1,14 @@
 mod api;
 mod app;
+// Parts of the frame bus / engine / framing API are only reached through the
+// REST API that lands in porting step 2 (docs_about__rserial/RSDA_PORTING_PLAN.md).
+#[allow(dead_code)]
+mod bus;
+#[allow(dead_code)]
+mod engine;
 mod events;
+#[allow(dead_code)]
+mod framing;
 mod serial;
 mod ui;
 

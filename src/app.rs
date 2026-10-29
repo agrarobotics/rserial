@@ -9,10 +9,22 @@ use ratatui::widgets::ListState;
 use serialport::{DataBits, Parity, StopBits};
 
 use crate::api::{ApiCommand, ApiState};
+use crate::bus::{BatchPolicy, Direction, Subscription};
+use crate::engine::Engine;
 use crate::serial::{self, PortInfo, SerialEvent, SerialHandle};
 
 const MAX_LINES: usize = 10_000;
 const MAX_RAW_CHUNKS: usize = 10_000;
+
+/// The TUI drains its subscription every tick, so batching knobs are unused;
+/// the queue only needs to absorb a burst between two ticks.
+const TUI_POLICY: BatchPolicy = BatchPolicy {
+    max_delay: Duration::from_millis(16),
+    min_interval: Duration::ZERO,
+    max_bytes: 64 * 1024,
+    max_frames: 512,
+    queue_frames: 100_000,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -205,6 +217,10 @@ pub struct App {
     pub config_field: ConfigField,
 
     // Connection
+    /// Shared serial state (frame log, stats, framing); outlives connections.
+    pub engine: Arc<Engine>,
+    /// This UI's feed of frames from the engine's bus.
+    frames: Subscription,
     pub serial_handle: Option<SerialHandle>,
     pub serial_rx: Option<Receiver<SerialEvent>>,
     pub connected: bool,
@@ -247,6 +263,8 @@ impl App {
         if !ports.is_empty() {
             port_list_state.select(Some(0));
         }
+        let engine = Arc::new(Engine::new());
+        let frames = engine.subscribe(TUI_POLICY);
         Self {
             mode: AppMode::SelectPort,
             should_quit: false,
@@ -254,6 +272,8 @@ impl App {
             port_list_state,
             config: SerialConfig::default(),
             config_field: ConfigField::BaudRate,
+            engine,
+            frames,
             serial_handle: None,
             serial_rx: None,
             connected: false,
@@ -296,12 +316,17 @@ impl App {
             None => return Ok(()),
         };
 
-        let (rx, handle) = serial::spawn_serial_reader(
+        // Frames still queued from an earlier session must not leak into
+        // the fresh buffer.
+        while self.frames.try_recv_batch().is_some() {}
+        self.engine.start_session(true);
+        let (rx, handle) = serial::spawn_serial(
             &port_name,
             self.config.baud_rate(),
             self.config.data_bits,
             self.config.parity,
             self.config.stop_bits,
+            Arc::clone(&self.engine),
         )?;
 
         self.serial_rx = Some(rx);
@@ -310,6 +335,7 @@ impl App {
         self.connected_port = port_name;
         self.bytes_rx = 0;
         self.bytes_tx = 0;
+        self.engine.clear_log();
         self.rx_lines.clear();
         self.rx_raw.clear();
         self.line_buf.clear();
@@ -331,12 +357,14 @@ impl App {
             return Ok(());
         }
         let port_name = self.connected_port.clone();
-        let (rx, handle) = serial::spawn_serial_reader(
+        self.engine.start_session(false);
+        let (rx, handle) = serial::spawn_serial(
             &port_name,
             self.config.baud_rate(),
             self.config.data_bits,
             self.config.parity,
             self.config.stop_bits,
+            Arc::clone(&self.engine),
         )?;
         self.serial_rx = Some(rx);
         self.serial_handle = Some(handle);
@@ -357,6 +385,21 @@ impl App {
     }
 
     pub fn poll_serial(&mut self) {
+        while let Some(batch) = self.frames.try_recv_batch() {
+            if batch.dropped_before > 0 {
+                self.set_status(&format!("{} frames dropped", batch.dropped_before));
+            }
+            for frame in batch.frames {
+                // The TUI shows received data only; TX is counted in the stats.
+                if frame.dir == Direction::Rx {
+                    self.push_rx(&frame.data);
+                }
+            }
+        }
+        let stats = self.engine.stats();
+        self.bytes_rx = stats.rx_bytes;
+        self.bytes_tx = stats.tx_bytes;
+
         // Drain events into a local vec to avoid borrow conflicts
         let events: Vec<SerialEvent> = {
             let Some(rx) = &self.serial_rx else {
@@ -378,39 +421,6 @@ impl App {
 
         for event in events {
             match event {
-                SerialEvent::Data(data) => {
-                    self.bytes_rx += data.len() as u64;
-                    self.rx_raw.push_back(data.clone());
-                    while self.rx_raw.len() > MAX_RAW_CHUNKS {
-                        self.rx_raw.pop_front();
-                    }
-                    for &byte in &data {
-                        if byte == b'\n' {
-                            let line = String::from_utf8_lossy(&self.line_buf).into_owned();
-                            self.rx_lines.push_back(line);
-                            self.line_buf.clear();
-                            while self.rx_lines.len() > MAX_LINES {
-                                self.rx_lines.pop_front();
-                                if self.selecting {
-                                    if self.selection_anchor == 0 && self.selection_cursor == 0 {
-                                        self.selecting = false;
-                                        self.status_message = Some((
-                                            "Selection lost (buffer overflow)".to_string(),
-                                            Instant::now(),
-                                        ));
-                                    } else {
-                                        self.selection_anchor =
-                                            self.selection_anchor.saturating_sub(1);
-                                        self.selection_cursor =
-                                            self.selection_cursor.saturating_sub(1);
-                                    }
-                                }
-                            }
-                        } else if byte != b'\r' {
-                            self.line_buf.push(byte);
-                        }
-                    }
-                }
                 SerialEvent::Error(e) => {
                     self.set_status(&format!("Error: {e}"));
                 }
@@ -425,6 +435,38 @@ impl App {
         }
     }
 
+    /// Append received bytes to the hex chunks and the text line buffer.
+    fn push_rx(&mut self, data: &[u8]) {
+        self.rx_raw.push_back(data.to_vec());
+        while self.rx_raw.len() > MAX_RAW_CHUNKS {
+            self.rx_raw.pop_front();
+        }
+        for &byte in data {
+            if byte == b'\n' {
+                let line = String::from_utf8_lossy(&self.line_buf).into_owned();
+                self.rx_lines.push_back(line);
+                self.line_buf.clear();
+                while self.rx_lines.len() > MAX_LINES {
+                    self.rx_lines.pop_front();
+                    if self.selecting {
+                        if self.selection_anchor == 0 && self.selection_cursor == 0 {
+                            self.selecting = false;
+                            self.status_message = Some((
+                                "Selection lost (buffer overflow)".to_string(),
+                                Instant::now(),
+                            ));
+                        } else {
+                            self.selection_anchor = self.selection_anchor.saturating_sub(1);
+                            self.selection_cursor = self.selection_cursor.saturating_sub(1);
+                        }
+                    }
+                }
+            } else if byte != b'\r' {
+                self.line_buf.push(byte);
+            }
+        }
+    }
+
     pub fn send_input(&mut self) {
         if self.input_text.is_empty() {
             return;
@@ -432,7 +474,6 @@ impl App {
         if let Some(handle) = &self.serial_handle {
             let mut data = self.input_text.clone().into_bytes();
             data.push(b'\n');
-            self.bytes_tx += data.len() as u64;
             if handle.tx_sender.send(data).is_err() {
                 self.set_status("Send failed: port closed");
             }
@@ -441,6 +482,7 @@ impl App {
     }
 
     pub fn clear_buffer(&mut self) {
+        self.engine.clear_log();
         self.rx_lines.clear();
         self.rx_raw.clear();
         self.line_buf.clear();
